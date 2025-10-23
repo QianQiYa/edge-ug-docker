@@ -1,27 +1,59 @@
 import JSEncrypt from 'jsencrypt'
 
-const config = {
-    alias: 'dx4600', // 绿联UGLinkID
-    username: "guest", // 绿联账号
-    password: "jL6w8uM4knMyHQr0", // 绿联密码
-    port: 5244 // 容器端口
-}
-
-const CacheManager = {
-    key: config.alias + ':' + config.port,
-    async get() {
-        const value = await nas.get(this.key)
+const Database = {
+    async getObject(key) {
+        const value = await nas.get(key)
         if (value == null) {
             return null
         }
         return JSON.parse(value)
     },
-    async set(value) {
-        await nas.put(this.key, JSON.stringify(value))
+    async setObject(key, value) {
+        if (value == null) {
+            await nas.delete(key)
+        } else {
+            await nas.put(this.key, JSON.stringify(value))
+        }
+    }
+}
+
+const CookieHelper = {
+    getSetCookieObject(response) {
+        const cookieObject = {}
+        const setCookie = response.headers.getSetCookie()
+        if (setCookie) {
+            for (let cookieStr of setCookie) {
+                const [key, value] = cookieStr.split(';')[0].split('=')
+                cookieObject[key] = value
+            }
+        }
+        return cookieObject
+    },
+    getCookieObject(cookieStr) {
+        const cookieObject = {}
+        if (cookieStr == null) {
+            return cookieObject
+        }
+        const cookieArr = cookieStr.split('; ')
+        for (let cookie of cookieArr) {
+            const cookieObj = cookie.split('=')
+            cookieObject[cookieObj[0]] = decodeURIComponent(cookieObj[1])
+        }
+        return cookieObject
+    },
+    getCookieStr(cookieObject) {
+        const cookieArr = []
+        if (cookieObject) {
+            for (let key of Object.keys(cookieObject)) {
+                cookieArr.push(key + '=' + encodeURIComponent(cookieObject[key]))
+            }
+        }
+        return cookieArr.join('; ')
     }
 }
 
 const getUGreenLink = async ctx => {
+    const config = ctx.config
     const aliasUrl = new URL('https://api-zh.ugnas.com/api/p2p/v2/ta/nodeInfo/byAlias')
     const response = await fetch(aliasUrl, {
         method: 'POST',
@@ -33,6 +65,7 @@ const getUGreenLink = async ctx => {
 }
 
 const getPublicKey = async ctx => {
+    const config = ctx.config
     const url = new URL(ctx.link + '/ugreen/v1/verify/check')
     const response = await fetch(url, {
         method: 'POST',
@@ -45,14 +78,15 @@ const getPublicKey = async ctx => {
     return atob(base64Str)
 }
 
-
 const getPassword = async ctx => {
+    const config = ctx.config
     const encryptor = new JSEncrypt()
     encryptor.setPublicKey(ctx.publicKey)
     return encryptor.encrypt(config.password)
 }
 
 const login = async ctx => {
+    const config = ctx.config
     const url = new URL(ctx.link + '/ugreen/v1/verify/login')
     const response = await fetch(url, {
         method: 'POST',
@@ -69,8 +103,8 @@ const login = async ctx => {
     return json.data
 }
 
-
 const getDockerToken = async ctx => {
+    const config = ctx.config
     const url = new URL(ctx.link + '/ugreen/v1/gateway/proxy/dockerToken')
     url.searchParams.set('token', ctx.token)
     url.searchParams.set('port', config.port)
@@ -84,13 +118,11 @@ const getProxyInfo = async ctx => {
         method: 'GET',
         redirect: 'manual',
     })
-    const cookieStr = response.headers.get('set-cookie')
-    const cookies = new Cookies(cookieStr, true)
     const origin = new URL(ctx.dockerToken).origin
-    const token = cookies.get('ugreen-proxy-token').value
+    const cookieObject = CookieHelper.getSetCookieObject(response)
+    const token = cookieObject['ugreen-proxy-token']
     return {origin, token}
 }
-
 
 const proxy = async (request, origin, token) => {
     const requestUrl = new URL(request.url)
@@ -101,11 +133,11 @@ const proxy = async (request, origin, token) => {
     const targetHeaders = new Headers(request.headers)
     targetHeaders.set('host', targetUrl.host)
     
-    const cookies = getCookies(targetHeaders.get('cookie'))
-    cookies['ugreen-proxy-token'] = token
-    targetHeaders.set('cookie', getCookieStr(cookies))
+    const cookieObject = CookieHelper.getCookieObject(request.headers.get('cookie'))
+    cookieObject['ugreen-proxy-token'] = token
+    targetHeaders.set('cookie', CookieHelper.getCookieStr(cookieObject))
     
-    const response =  await fetch(targetUrl, {
+    const response = await fetch(targetUrl, {
         method: request.method,
         headers: targetHeaders,
         body: request.body,
@@ -125,46 +157,29 @@ const proxy = async (request, origin, token) => {
     return response
 }
 
-
-
-const getCookies = cookieStr => {
-    const cookieMap = {}
-    if (cookieStr == null) {
-        return cookieMap
-    }
-    const cookieArr = cookieStr.split('; ')
-    for (let cookie of cookieArr) {
-        const cookieObj = cookie.split('=')
-        cookieMap[cookieObj[0]] = decodeURIComponent(cookieObj[1])
-    }
-    return cookieMap
-}
-
-const getCookieStr = cookieMap => {
-    const cookieArr = []
-    for (let key of Object.keys(cookieMap)) {
-        cookieArr.push(key + '=' + encodeURIComponent(cookieMap[key]))
-    }
-    return cookieArr.join('; ')
-}
-
-
 export async function onRequest(context) {
     const request = context.request
-    
+    const env = context.env
+    const config = {
+        alias: env.UG_LINK,
+        username: env.UG_USERNAME,
+        password: env.UG_PASSWORD,
+        port: env.UG_PORT
+    }
+    const ctx = {}
+    const key = config.alias + ':' + config.port
     try {
-        const cache = await CacheManager.get()
+        const cache = await Database.getObject(key)
         if (cache) {
-            const response =  await proxy(request, cache.origin, cache.token)
+            const response = await proxy(request, cache.origin, cache.token)
             response.headers.set('x-edge-kv', 'hit')
             return response
         }
     } catch (error) {
         console.log('缓存访问出错')
     }
-    
+    ctx.config = config
     try {
-        const ctx = {}
         ctx.link = await getUGreenLink(ctx)
         ctx.publicKey = await getPublicKey(ctx)
         ctx.password = await getPassword(ctx)
@@ -176,11 +191,11 @@ export async function onRequest(context) {
         ctx.proxyToken = proxyInfo.token
         const response = await proxy(request, ctx.proxyOrigin, ctx.proxyToken)
         response.headers.set('x-edge-kv', 'miss')
-        await CacheManager.set({origin: ctx.proxyOrigin, token: ctx.proxyToken})
+        await Database.setObject(key, {origin: ctx.proxyOrigin, token: ctx.proxyToken})
         return response
     } catch (error) {
+        console.log('error', error)
         return new Response('访问出错', {status: 500})
     }
-    
 }
 
